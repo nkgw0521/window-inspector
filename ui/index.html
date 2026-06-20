@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Window Inspector</title>
+  <script type="module">
+    import { invoke } from "https://unpkg.com/@tauri-apps/api@2/core";
+    import { listen } from "https://unpkg.com/@tauri-apps/api@2/event";
+
+    // ------------------------------------------------------------------
+    // 状態
+    // ------------------------------------------------------------------
+    let allWindows = [];
+    let filterText = "";
+    let showInvisible = true;
+    let sortKey = "z_order";
+    let sortAsc = true;
+
+    // ------------------------------------------------------------------
+    // 初期取得
+    // ------------------------------------------------------------------
+    async function fetchWindows() {
+      allWindows = await invoke("get_windows");
+      renderTable();
+    }
+
+    // ------------------------------------------------------------------
+    // イベント駆動更新
+    // windows-changed イベントを受信するたびに再描画
+    // ------------------------------------------------------------------
+    await listen("windows-changed", (event) => {
+      allWindows = event.payload;
+      updateStatus(`最終更新: ${new Date().toLocaleTimeString()}`);
+      renderTable();
+    });
+
+    // ------------------------------------------------------------------
+    // テーブル描画
+    // ------------------------------------------------------------------
+    function renderTable() {
+      let data = [...allWindows];
+
+      // フィルタ
+      if (filterText) {
+        const q = filterText.toLowerCase();
+        data = data.filter(w =>
+          w.title.toLowerCase().includes(q) ||
+          w.process_name.toLowerCase().includes(q) ||
+          w.class_name.toLowerCase().includes(q)
+        );
+      }
+      if (!showInvisible) {
+        data = data.filter(w => w.is_visible);
+      }
+
+      // ソート
+      data.sort((a, b) => {
+        let va = a[sortKey];
+        let vb = b[sortKey];
+        if (typeof va === "string") va = va.toLowerCase();
+        if (typeof vb === "string") vb = vb.toLowerCase();
+        if (va < vb) return sortAsc ? -1 : 1;
+        if (va > vb) return sortAsc ? 1 : -1;
+        return 0;
+      });
+
+      const tbody = document.querySelector("#window-table tbody");
+      tbody.innerHTML = "";
+
+      for (const w of data) {
+        const tr = document.createElement("tr");
+        if (!w.is_visible) tr.classList.add("invisible");
+        if (w.is_minimized) tr.classList.add("minimized");
+        tr.title = "クリックでタイトルをコピー";
+        tr.dataset.title = w.title;
+
+        const state = w.is_minimized ? "最小化"
+                    : w.is_maximized ? "最大化"
+                    : w.is_visible   ? "表示"
+                    : "非表示";
+
+        const stateCls = w.is_minimized ? "state-min"
+                       : w.is_maximized ? "state-max"
+                       : w.is_visible   ? "state-vis"
+                       : "state-hid";
+
+        tr.innerHTML = `
+          <td class="col-zorder">${w.z_order}</td>
+          <td class="col-hwnd">0x${w.hwnd.toString(16).toUpperCase()}</td>
+          <td class="col-title" title="${esc(w.title)}">${esc(w.title) || "<em>（なし）</em>"}</td>
+          <td class="col-process" title="${esc(w.process_name)}">${esc(w.process_name)}</td>
+          <td class="col-pid">${w.pid}</td>
+          <td class="col-class" title="${esc(w.class_name)}">${esc(w.class_name)}</td>
+          <td class="col-pos">(${w.x}, ${w.y})</td>
+          <td class="col-size">${w.width} × ${w.height}</td>
+          <td class="col-dpi">${w.dpi}</td>
+          <td class="col-state"><span class="state-badge ${stateCls}">${state}</span></td>
+        `;
+
+        // 行クリックでタイトルをクリップボードへコピー
+        tr.addEventListener("click", () => copyRowTitle(tr));
+
+        tbody.appendChild(tr);
+      }
+
+      document.getElementById("count").textContent =
+        `${data.length} / ${allWindows.length} ウィンドウ`;
+    }
+
+    function esc(s) {
+      return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    }
+
+    // ------------------------------------------------------------------
+    // 行クリック → タイトルをクリップボードへコピー
+    // ------------------------------------------------------------------
+    async function copyRowTitle(tr) {
+      const text = tr.dataset.title || "";
+      try {
+        await navigator.clipboard.writeText(text);
+        flashRow(tr, true);
+        showToast(text ? `コピーしました: ${text}` : "（タイトルなし）をコピーしました");
+      } catch (err) {
+        flashRow(tr, false);
+        showToast("コピーに失敗しました", true);
+        console.error("clipboard write error:", err);
+      }
+    }
+
+    function flashRow(tr, success) {
+      tr.classList.remove("copied", "copy-failed");
+      // 強制リフロー（連続クリックでもアニメーションを再生させる）
+      void tr.offsetWidth;
+      tr.classList.add(success ? "copied" : "copy-failed");
+      setTimeout(() => tr.classList.remove("copied", "copy-failed"), 600);
+    }
+
+    let toastTimer = null;
+    function showToast(message, isError = false) {
+      const toast = document.getElementById("toast");
+      toast.textContent = message;
+      toast.classList.toggle("toast-error", isError);
+      toast.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toast.classList.remove("show"), 1800);
+    }
+
+    function updateStatus(msg) {
+      document.getElementById("status").textContent = msg;
+    }
+
+    // ------------------------------------------------------------------
+    // ソートヘッダクリック
+    // ------------------------------------------------------------------
+    document.querySelectorAll("th[data-key]").forEach(th => {
+      th.addEventListener("click", () => {
+        const key = th.dataset.key;
+        if (sortKey === key) {
+          sortAsc = !sortAsc;
+        } else {
+          sortKey = key;
+          sortAsc = true;
+        }
+        document.querySelectorAll("th[data-key]").forEach(t => t.classList.remove("sort-asc","sort-desc"));
+        th.classList.add(sortAsc ? "sort-asc" : "sort-desc");
+        renderTable();
+      });
+    });
+
+    // ------------------------------------------------------------------
+    // フィルタ
+    // ------------------------------------------------------------------
+    document.getElementById("filter").addEventListener("input", e => {
+      filterText = e.target.value;
+      renderTable();
+    });
+
+    document.getElementById("toggle-invisible").addEventListener("change", e => {
+      showInvisible = e.target.checked;
+      renderTable();
+    });
+
+    // ------------------------------------------------------------------
+    // 手動更新ボタン
+    // ------------------------------------------------------------------
+    document.getElementById("refresh-btn").addEventListener("click", fetchWindows);
+
+    // ------------------------------------------------------------------
+    // 起動
+    // ------------------------------------------------------------------
+    fetchWindows();
+  </script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Segoe UI", "Meiryo", sans-serif;
+      font-size: 13px;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ツールバー */
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 12px;
+      background: #181825;
+      border-bottom: 1px solid #313244;
+      flex-shrink: 0;
+    }
+
+    #toolbar h1 {
+      font-size: 14px;
+      font-weight: 600;
+      color: #cba6f7;
+      letter-spacing: 0.04em;
+      margin-right: 8px;
+    }
+
+    #filter {
+      flex: 1;
+      max-width: 320px;
+      padding: 4px 10px;
+      border-radius: 4px;
+      border: 1px solid #45475a;
+      background: #313244;
+      color: #cdd6f4;
+      outline: none;
+      font-size: 13px;
+    }
+    #filter::placeholder { color: #585b70; }
+    #filter:focus { border-color: #cba6f7; }
+
+    label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      user-select: none;
+      color: #a6adc8;
+    }
+
+    #refresh-btn {
+      margin-left: auto;
+      padding: 4px 14px;
+      border-radius: 4px;
+      border: 1px solid #45475a;
+      background: #313244;
+      color: #cdd6f4;
+      cursor: pointer;
+      font-size: 12px;
+      transition: background 0.15s;
+    }
+    #refresh-btn:hover { background: #45475a; }
+
+    /* ステータスバー */
+    #statusbar {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 4px 12px;
+      background: #181825;
+      border-bottom: 1px solid #313244;
+      font-size: 11px;
+      color: #6c7086;
+      flex-shrink: 0;
+    }
+    #statusbar .hint { color: #45475a; }
+    #statusbar #status { margin-left: auto; }
+
+    /* テーブルエリア */
+    #table-wrap {
+      flex: 1;
+      overflow: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+
+    thead {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: #181825;
+    }
+
+    th {
+      padding: 6px 8px;
+      text-align: left;
+      font-weight: 600;
+      color: #a6adc8;
+      border-bottom: 2px solid #313244;
+      white-space: nowrap;
+      user-select: none;
+    }
+    th[data-key] { cursor: pointer; }
+    th[data-key]:hover { color: #cba6f7; }
+    th.sort-asc::after  { content: " ▲"; color: #cba6f7; }
+    th.sort-desc::after { content: " ▼"; color: #cba6f7; }
+
+    /* 列幅 */
+    .col-zorder  { width: 46px; }
+    .col-hwnd    { width: 90px; }
+    .col-title   { width: auto; }
+    .col-process { width: 130px; }
+    .col-pid     { width: 60px; }
+    .col-class   { width: 160px; }
+    .col-pos     { width: 100px; }
+    .col-size    { width: 100px; }
+    .col-dpi     { width: 50px; }
+    .col-state   { width: 72px; }
+
+    td {
+      padding: 4px 8px;
+      border-bottom: 1px solid #1e1e2e;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+
+    tbody tr:hover td { background: #2a2a3d; }
+    tbody tr { cursor: pointer; }
+    tbody tr.invisible td { color: #585b70; }
+    tbody tr.minimized td { font-style: italic; }
+
+    /* コピー時のフラッシュ演出 */
+    tbody tr.copied td {
+      background: #a6e3a133;
+      transition: background 0.15s ease-out;
+    }
+    tbody tr.copy-failed td {
+      background: #f38ba833;
+      transition: background 0.15s ease-out;
+    }
+
+    /* トースト通知 */
+    #toast {
+      position: fixed;
+      left: 50%;
+      bottom: 24px;
+      transform: translateX(-50%) translateY(12px);
+      max-width: 80vw;
+      padding: 8px 16px;
+      border-radius: 6px;
+      background: #313244;
+      color: #a6e3a1;
+      border: 1px solid #45475a;
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.15s ease, transform 0.15s ease;
+      z-index: 100;
+    }
+    #toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+    #toast.toast-error { color: #f38ba8; }
+
+    /* 状態バッジ */
+    .state-badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .state-vis { background: #a6e3a133; color: #a6e3a1; }
+    .state-min { background: #89b4fa33; color: #89b4fa; }
+    .state-max { background: #f9e2af33; color: #f9e2af; }
+    .state-hid { background: #45475a44; color: #6c7086; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <h1>🔍 Window Inspector</h1>
+    <input id="filter" type="search" placeholder="タイトル / プロセス名 / クラス名で絞り込み" />
+    <label>
+      <input id="toggle-invisible" type="checkbox" checked />
+      非表示ウィンドウも表示
+    </label>
+    <button id="refresh-btn">⟳ 手動更新</button>
+  </div>
+
+  <div id="statusbar">
+    <span id="count">-</span>
+    <span class="hint">行をクリックでタイトルをコピー</span>
+    <span id="status">起動中...</span>
+  </div>
+
+  <div id="table-wrap">
+    <table id="window-table">
+      <thead>
+        <tr>
+          <th data-key="z_order"     class="col-zorder  sort-asc">Z順</th>
+          <th data-key="hwnd"        class="col-hwnd">HWND</th>
+          <th data-key="title"       class="col-title">タイトル</th>
+          <th data-key="process_name"class="col-process">プロセス名</th>
+          <th data-key="pid"         class="col-pid">PID</th>
+          <th data-key="class_name"  class="col-class">クラス名</th>
+          <th                        class="col-pos">座標(左上)</th>
+          <th                        class="col-size">幅 × 高さ</th>
+          <th data-key="dpi"         class="col-dpi">DPI</th>
+          <th data-key="is_visible"  class="col-state">状態</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div id="toast"></div>
+</body>
+</html>
