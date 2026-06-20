@@ -2,7 +2,7 @@ mod window_enum;
 mod window_info;
 
 use tauri::{AppHandle, Emitter};
-use window_enum::{enumerate_windows, register_hooks, unregister_hooks};
+use window_enum::{enumerate_windows, focus_window as focus_window_impl, register_hooks, unregister_hooks};
 use window_info::WindowInfo;
 
 // ---------------------------------------------------------------------------
@@ -14,6 +14,14 @@ use window_info::WindowInfo;
 #[tauri::command]
 fn get_windows() -> Vec<WindowInfo> {
     enumerate_windows()
+}
+
+/// 指定したウィンドウをフォアグラウンドにする（Alt+Tab代替）
+/// 戻り値: true = 前面化成功 / false = 前面化失敗（最小化解除は行われている場合あり）
+/// フロントエンド: await invoke("focus_window", { hwnd })
+#[tauri::command]
+fn focus_window(hwnd: usize) -> Result<bool, String> {
+    focus_window_impl(hwnd)
 }
 
 // ---------------------------------------------------------------------------
@@ -52,7 +60,10 @@ fn main() {
                 unregister_hooks();
             }
         })
-        .invoke_handler(tauri::generate_handler![get_windows])
+        .invoke_handler(tauri::generate_handler![
+            get_windows,
+            focus_window
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

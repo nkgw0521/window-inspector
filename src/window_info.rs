@@ -38,6 +38,10 @@ pub struct WindowInfo {
     /// 最大化状態（IsZoomed）
     pub is_maximized: bool,
 
+    /// 親ウィンドウのHWND（GetParent）
+    /// 0 はトップレベルウィンドウ（親なし）を意味する
+    pub parent_hwnd: usize,
+
     /// Zオーダー（EnumWindows の列挙順: 0が最前面）
     pub z_order: usize,
 

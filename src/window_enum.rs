@@ -11,12 +11,13 @@ use windows::Win32::{
         Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
         HiDpi::GetDpiForWindow,
         WindowsAndMessaging::{
-            EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextW,
-            GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed,
+            EnumWindows, GetClassNameW, GetParent, GetWindowRect, GetWindowTextW,
+            GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+            SetForegroundWindow, ShowWindow,
             EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
-            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE,
+            EVENT_OBJECT_NAMECHANGE,
             EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE,
-            WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+            SW_RESTORE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
         },
     },
 };
@@ -51,6 +52,10 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
     // PID取得
     let mut pid: u32 = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
+
+    // 親ウィンドウHWND取得（トップレベルなら通常0=NULL）
+    // GetParentは子ウィンドウなら親を、WS_POPUPなら所有者ウィンドウを返す
+    let parent_hwnd = GetParent(hwnd).unwrap_or_default().0 as usize;
 
     // プロセス名取得
     // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ が必要
@@ -106,6 +111,7 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
         is_visible,
         is_minimized,
         is_maximized,
+        parent_hwnd,
         z_order,
         dpi,
     });
@@ -267,6 +273,49 @@ pub fn unregister_hooks() {
 
 #[cfg(not(target_os = "windows"))]
 pub fn register_hooks(_emit_fn: EmitFn) {}
+
+// ---------------------------------------------------------------------------
+// ウィンドウ操作（フォーカス切替）
+// ---------------------------------------------------------------------------
+
+/// 指定したHWNDのウィンドウをフォアグラウンドにする
+///
+/// # 戻り値
+/// - Ok(true):  フォアグラウンド化に成功
+/// - Ok(false): ウィンドウは存在するが SetForegroundWindow が失敗
+///              （Windowsのフォーカス窃取防止ポリシーによるもの。エラーではない）
+/// - Err:       ウィンドウが既に存在しない場合
+///
+/// # 設計メモ
+/// SetForegroundWindowは「呼び出し元が最後に入力イベントを受け取った」等の
+/// 条件を満たさないと失敗する（仕様）。本アプリはユーザーのクリック操作を
+/// 起点に呼び出すため通常は成功するが、保険として以下を行う:
+///   1. 最小化されていれば ShowWindow(SW_RESTORE) で先に復元する
+///   2. それでも失敗したら呼び出し元にfalseを返し、UI側で
+///      「最小化解除のみ成功・前面化は失敗」等の表示を可能にする
+#[cfg(target_os = "windows")]
+pub fn focus_window(hwnd_value: usize) -> Result<bool, String> {
+    let hwnd = HWND(hwnd_value as *mut core::ffi::c_void);
+
+    unsafe {
+        if !IsWindow(hwnd).as_bool() {
+            return Err("ウィンドウが見つかりません（既に閉じられた可能性があります）".into());
+        }
+
+        // 最小化されている場合は先に復元する
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+
+        let ok = SetForegroundWindow(hwnd).as_bool();
+        Ok(ok)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn focus_window(_hwnd_value: usize) -> Result<bool, String> {
+    Err("この機能はWindows専用です".into())
+}
 
 #[cfg(not(target_os = "windows"))]
 pub fn unregister_hooks() {}

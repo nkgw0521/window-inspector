@@ -13,30 +13,42 @@
     // ------------------------------------------------------------------
     let allWindows = [];
     let filterText = "";
-    let showInvisible = true;
+    let showInvisible = false;
     let sortKey = "z_order";
     let sortAsc = true;
+    let viewMode = "flat"; // "flat" | "tree"
+    let autoRefresh = false; // 自動更新（イベント駆動の反映）の有効/無効。初期値はOff
+    let pendingUpdate = false; // 自動更新Off中に未反映の更新が来ているか
 
     // ------------------------------------------------------------------
     // 初期取得
     // ------------------------------------------------------------------
     async function fetchWindows() {
       allWindows = await invoke("get_windows");
+      pendingUpdate = false;
+      updateStatus(`最終更新: ${new Date().toLocaleTimeString()}`);
       renderTable();
     }
 
     // ------------------------------------------------------------------
     // イベント駆動更新
-    // windows-changed イベントを受信するたびに再描画
+    // windows-changed イベントを受信するたびに再描画する。
+    // ただし自動更新がOffの場合は、行クリックを邪魔しないよう
+    // テーブルの再描画はスキップし、更新が来ていることだけを示す。
     // ------------------------------------------------------------------
     await listen("windows-changed", (event) => {
       allWindows = event.payload;
-      updateStatus(`最終更新: ${new Date().toLocaleTimeString()}`);
-      renderTable();
+      if (autoRefresh) {
+        updateStatus(`最終更新: ${new Date().toLocaleTimeString()}`);
+        renderTable();
+      } else {
+        pendingUpdate = true;
+        updateStatus(`更新あり（手動更新で反映） / 最終取得: ${new Date().toLocaleTimeString()}`);
+      }
     });
 
     // ------------------------------------------------------------------
-    // テーブル描画
+    // テーブル描画（フラット / ツリー両対応）
     // ------------------------------------------------------------------
     function renderTable() {
       let data = [...allWindows];
@@ -54,62 +66,156 @@
         data = data.filter(w => w.is_visible);
       }
 
-      // ソート
-      data.sort((a, b) => {
-        let va = a[sortKey];
-        let vb = b[sortKey];
-        if (typeof va === "string") va = va.toLowerCase();
-        if (typeof vb === "string") vb = vb.toLowerCase();
-        if (va < vb) return sortAsc ? -1 : 1;
-        if (va > vb) return sortAsc ? 1 : -1;
-        return 0;
-      });
-
       const tbody = document.querySelector("#window-table tbody");
       tbody.innerHTML = "";
 
-      for (const w of data) {
-        const tr = document.createElement("tr");
-        if (!w.is_visible) tr.classList.add("invisible");
-        if (w.is_minimized) tr.classList.add("minimized");
-        tr.title = "クリックでタイトルをコピー";
-        tr.dataset.title = w.title;
-
-        const state = w.is_minimized ? "最小化"
-                    : w.is_maximized ? "最大化"
-                    : w.is_visible   ? "表示"
-                    : "非表示";
-
-        const stateCls = w.is_minimized ? "state-min"
-                       : w.is_maximized ? "state-max"
-                       : w.is_visible   ? "state-vis"
-                       : "state-hid";
-
-        tr.innerHTML = `
-          <td class="col-zorder">${w.z_order}</td>
-          <td class="col-hwnd">0x${w.hwnd.toString(16).toUpperCase()}</td>
-          <td class="col-title" title="${esc(w.title)}">${esc(w.title) || "<em>（なし）</em>"}</td>
-          <td class="col-process" title="${esc(w.process_name)}">${esc(w.process_name)}</td>
-          <td class="col-pid">${w.pid}</td>
-          <td class="col-class" title="${esc(w.class_name)}">${esc(w.class_name)}</td>
-          <td class="col-pos">(${w.x}, ${w.y})</td>
-          <td class="col-size">${w.width} × ${w.height}</td>
-          <td class="col-dpi">${w.dpi}</td>
-          <td class="col-state"><span class="state-badge ${stateCls}">${state}</span></td>
-        `;
-
-        // 行クリックでタイトルをクリップボードへコピー
-        tr.addEventListener("click", () => copyRowTitle(tr));
-
-        tbody.appendChild(tr);
+      if (viewMode === "tree") {
+        renderTreeRows(tbody, data);
+      } else {
+        // ソート（フラット表示のみ。ツリーはZ順固定の階層表示にする）
+        data.sort((a, b) => {
+          let va = a[sortKey];
+          let vb = b[sortKey];
+          if (typeof va === "string") va = va.toLowerCase();
+          if (typeof vb === "string") vb = vb.toLowerCase();
+          if (va < vb) return sortAsc ? -1 : 1;
+          if (va > vb) return sortAsc ? 1 : -1;
+          return 0;
+        });
+        for (const w of data) {
+          tbody.appendChild(buildRow(w, 0));
+        }
       }
 
       document.getElementById("count").textContent =
         `${data.length} / ${allWindows.length} ウィンドウ`;
     }
 
+    // ------------------------------------------------------------------
+    // ツリー構築
+    // 表示中の集合(visibleSet)に含まれるウィンドウだけを対象に親子関係を組む。
+    // 親がフィルタで除外されている場合は、その子をトップレベル扱いにして
+    // ツリーが消えてしまわないようにする。
+    // ------------------------------------------------------------------
+    function renderTreeRows(tbody, data) {
+      const byHwnd = new Map(data.map(w => [w.hwnd, w]));
+      const childrenMap = new Map(); // parent_hwnd -> [WindowInfo...]
+
+      for (const w of data) {
+        const hasVisibleParent = w.parent_hwnd !== 0 && byHwnd.has(w.parent_hwnd);
+        const key = hasVisibleParent ? w.parent_hwnd : 0; // 0 = ルート
+        if (!childrenMap.has(key)) childrenMap.set(key, []);
+        childrenMap.get(key).push(w);
+      }
+
+      // 各階層はZ順でソート
+      for (const list of childrenMap.values()) {
+        list.sort((a, b) => a.z_order - b.z_order);
+      }
+
+      function appendChildren(parentKey, depth) {
+        const list = childrenMap.get(parentKey) || [];
+        for (const w of list) {
+          tbody.appendChild(buildRow(w, depth));
+          appendChildren(w.hwnd, depth + 1);
+        }
+      }
+      appendChildren(0, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // 1行分のDOM構築（フラット/ツリー共通）
+    // depth > 0 のときタイトル列にインデントとツリー記号を付与する
+    // ------------------------------------------------------------------
+    function buildRow(w, depth) {
+      const tr = document.createElement("tr");
+      if (!w.is_visible) tr.classList.add("invisible");
+      if (w.is_minimized) tr.classList.add("minimized");
+      tr.title = "クリック: タイトルをコピー / 素早く2回クリック: 前面化";
+      tr.dataset.title = w.title;
+      tr.dataset.hwnd = w.hwnd;
+      tr.dataset.x = w.x;
+      tr.dataset.y = w.y;
+      tr.dataset.width = w.width;
+      tr.dataset.height = w.height;
+
+      const state = w.is_minimized ? "最小化"
+                  : w.is_maximized ? "最大化"
+                  : w.is_visible   ? "表示"
+                  : "非表示";
+
+      const stateCls = w.is_minimized ? "state-min"
+                     : w.is_maximized ? "state-max"
+                     : w.is_visible   ? "state-vis"
+                     : "state-hid";
+
+      const titleText = esc(w.title) || "<em>（なし）</em>";
+      const titleCell = depth > 0
+        ? `<span class="tree-indent" style="width:${depth * 18}px"></span><span class="tree-branch">└</span>${titleText}`
+        : titleText;
+
+      tr.innerHTML = `
+        <td class="col-zorder">${w.z_order}</td>
+        <td class="col-hwnd">0x${w.hwnd.toString(16).toUpperCase()}</td>
+        <td class="col-title" title="${esc(w.title)}">${titleCell}</td>
+        <td class="col-process" title="${esc(w.process_name)}">${esc(w.process_name)}</td>
+        <td class="col-pid">${w.pid}</td>
+        <td class="col-class" title="${esc(w.class_name)}">${esc(w.class_name)}</td>
+        <td class="col-pos">(${w.x}, ${w.y})</td>
+        <td class="col-size">${w.width} × ${w.height}</td>
+        <td class="col-dpi">${w.dpi}</td>
+        <td class="col-state"><span class="state-badge ${stateCls}">${state}</span></td>
+      `;
+
+      // シングルクリック: タイトルをコピー＋画面上をハイライト
+      // ダブルクリック: そのウィンドウを前面化（Alt+Tab代替）
+      //
+      // 注意: ブラウザ標準の dblclick には頼らない。
+      // ウィンドウ一覧はイベント駆動で頻繁に再描画され、その都度 <tr> が
+      // 作り直される。dblclick は「同一DOM要素への2回のクリック」を前提に
+      // 判定するため、1回目と2回目のクリックの間に再描画が挟まると
+      // 別要素とみなされ発火しない。そのためhwnd（安定したID）をキーに
+      // 自前でタイミング判定する。
+      tr.addEventListener("click", () => handleRowClick(w.hwnd, tr));
+
+      return tr;
+    }
+
     function esc(s) {
       return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    }
+
+    // ------------------------------------------------------------------
+    // クリック判定（hwndキーで管理、DOM要素の再生成に影響されない）
+    // 同一hwndへの2回目のクリックがDOUBLE_CLICK_MS以内に来たら「ダブルクリック」扱い。
+    // ------------------------------------------------------------------
+    // Windowsのデフォルトダブルクリック判定時間は500ms（GetDoubleClickTime既定値）
+    const DOUBLE_CLICK_MS = 500;
+    // シングルクリック確定までの待機はDOUBLE_CLICK_MSより少し長く取り、
+    // 2回目のクリックがギリギリのタイミングで来てもコピー処理が先に
+    // 走ってしまわないようにする。
+    const SINGLE_CLICK_DELAY_MS = DOUBLE_CLICK_MS + 50;
+    let lastClick = { hwnd: null, time: 0 };
+    let singleClickTimer = null;
+
+    function handleRowClick(hwnd, tr) {
+      const now = Date.now();
+      const isDouble = lastClick.hwnd === hwnd && (now - lastClick.time) < DOUBLE_CLICK_MS;
+
+      if (isDouble) {
+        // ダブルクリック確定: 保留中のシングルクリック処理をキャンセルして前面化
+        clearTimeout(singleClickTimer);
+        lastClick = { hwnd: null, time: 0 }; // 3連続クリックの誤判定防止
+        focusRow(tr);
+        return;
+      }
+
+      lastClick = { hwnd, time: now };
+      // シングルクリック処理はダブルクリック判定の猶予を見てから実行する
+      clearTimeout(singleClickTimer);
+      singleClickTimer = setTimeout(() => {
+        copyRowTitle(tr);
+      }, SINGLE_CLICK_DELAY_MS);
     }
 
     // ------------------------------------------------------------------
@@ -125,6 +231,28 @@
         flashRow(tr, false);
         showToast("コピーに失敗しました", true);
         console.error("clipboard write error:", err);
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // ダブルクリックでウィンドウを前面化（Alt+Tab代替）
+    // ------------------------------------------------------------------
+    async function focusRow(tr) {
+      const hwnd = Number(tr.dataset.hwnd);
+      try {
+        const ok = await invoke("focus_window", { hwnd });
+        if (ok) {
+          showToast(`前面化しました: ${tr.dataset.title || "(なし)"}`);
+        } else {
+          // Windowsのフォーカス窃取防止ポリシーにより失敗する場合がある。
+          // 最小化解除は行われている可能性があるため、その旨を伝える。
+          showToast("前面化できませんでした（タスクバーで点滅している場合があります）", true);
+        }
+        flashRow(tr, ok);
+      } catch (err) {
+        showToast(String(err), true);
+        flashRow(tr, false);
+        console.error("focus error:", err);
       }
     }
 
@@ -151,10 +279,24 @@
     }
 
     // ------------------------------------------------------------------
+    // ビュー切替（フラット / ツリー）
+    // ------------------------------------------------------------------
+    document.querySelectorAll(".view-tab").forEach(btn => {
+      btn.addEventListener("click", () => {
+        viewMode = btn.dataset.view;
+        document.querySelectorAll(".view-tab").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        document.getElementById("window-table").dataset.view = viewMode;
+        renderTable();
+      });
+    });
+
+    // ------------------------------------------------------------------
     // ソートヘッダクリック
     // ------------------------------------------------------------------
     document.querySelectorAll("th[data-key]").forEach(th => {
       th.addEventListener("click", () => {
+        if (viewMode === "tree") return; // ツリー表示はZ順階層固定
         const key = th.dataset.key;
         if (sortKey === key) {
           sortAsc = !sortAsc;
@@ -179,6 +321,18 @@
     document.getElementById("toggle-invisible").addEventListener("change", e => {
       showInvisible = e.target.checked;
       renderTable();
+    });
+
+    document.getElementById("toggle-autorefresh").addEventListener("change", e => {
+      autoRefresh = e.target.checked;
+      if (autoRefresh && pendingUpdate) {
+        // Offの間に溜まっていた更新があれば、Onにした時点で反映する
+        pendingUpdate = false;
+        renderTable();
+      }
+      updateStatus(autoRefresh
+        ? `最終更新: ${new Date().toLocaleTimeString()}`
+        : "自動更新オフ");
     });
 
     // ------------------------------------------------------------------
@@ -223,6 +377,31 @@
       color: #cba6f7;
       letter-spacing: 0.04em;
       margin-right: 8px;
+    }
+
+    /* ビュー切替タブ */
+    #view-tabs {
+      display: flex;
+      border: 1px solid #45475a;
+      border-radius: 4px;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .view-tab {
+      padding: 4px 12px;
+      background: #313244;
+      color: #a6adc8;
+      border: none;
+      cursor: pointer;
+      font-size: 12px;
+      transition: background 0.15s, color 0.15s;
+    }
+    .view-tab + .view-tab { border-left: 1px solid #45475a; }
+    .view-tab:hover { background: #45475a; }
+    .view-tab.active {
+      background: #cba6f733;
+      color: #cba6f7;
+      font-weight: 600;
     }
 
     #filter {
@@ -273,8 +452,8 @@
       color: #6c7086;
       flex-shrink: 0;
     }
-    #statusbar .hint { color: #45475a; }
-    #statusbar #status { margin-left: auto; }
+    #statusbar .hint { color: #45475a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #statusbar #status { margin-left: auto; flex-shrink: 0; }
 
     /* テーブルエリア */
     #table-wrap {
@@ -372,6 +551,18 @@
     }
     #toast.toast-error { color: #f38ba8; }
 
+    /* ツリー表示のインデント記号 */
+    .tree-indent {
+      display: inline-block;
+      vertical-align: middle;
+    }
+    .tree-branch {
+      display: inline-block;
+      margin-right: 4px;
+      color: #585b70;
+      vertical-align: middle;
+    }
+
     /* 状態バッジ */
     .state-badge {
       display: inline-block;
@@ -389,22 +580,30 @@
 <body>
   <div id="toolbar">
     <h1>🔍 Window Inspector</h1>
+    <div id="view-tabs">
+      <button class="view-tab active" data-view="flat">フラット</button>
+      <button class="view-tab" data-view="tree">ツリー</button>
+    </div>
     <input id="filter" type="search" placeholder="タイトル / プロセス名 / クラス名で絞り込み" />
     <label>
-      <input id="toggle-invisible" type="checkbox" checked />
+      <input id="toggle-invisible" type="checkbox" />
       非表示ウィンドウも表示
+    </label>
+    <label>
+      <input id="toggle-autorefresh" type="checkbox" />
+      自動更新
     </label>
     <button id="refresh-btn">⟳ 手動更新</button>
   </div>
 
   <div id="statusbar">
     <span id="count">-</span>
-    <span class="hint">行をクリックでタイトルをコピー</span>
+    <span class="hint">クリック: タイトルをコピー　/　素早く2回クリック: 前面化</span>
     <span id="status">起動中...</span>
   </div>
 
   <div id="table-wrap">
-    <table id="window-table">
+    <table id="window-table" data-view="flat">
       <thead>
         <tr>
           <th data-key="z_order"     class="col-zorder  sort-asc">Z順</th>
