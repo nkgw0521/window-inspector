@@ -13,7 +13,9 @@
         "title": "Window Inspector",
         "width": 1200,
         "height": 720,
-        "resizable": true
+        "resizable": true,
+        "visible": true,
+        "backgroundColor": "#1e1e2e"
       }
     ],
     "security": {

@@ -1,3 +1,9 @@
+// Windowsサブシステムとしてビルドする。
+// これを指定しないとコンソールサブシステムとしてビルドされ、
+// 起動時に真っ黒なコンソールウィンドウ（PseudoConsoleWindow）が
+// 背後に生成されてしまう。
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod window_enum;
 mod window_info;
 
